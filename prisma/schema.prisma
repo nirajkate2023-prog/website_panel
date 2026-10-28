@@ -1,0 +1,340 @@
+// Get-ID admin panel - data model
+// Money is stored as BigInt in paise (1 rupee = 100 paise) so balances stay exact.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Hierarchy: SUPER_ADMIN > WHITE_LABEL > MASTER > EMPLOYEE > CLIENT
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  WHITE_LABEL
+  MASTER
+  EMPLOYEE
+}
+
+enum RequestType {
+  DEPOSIT
+  WITHDRAWAL
+}
+
+enum RequestStatus {
+  PENDING
+  ON_HOLD
+  APPROVED
+  REJECTED
+}
+
+enum LedgerType {
+  DEPOSIT
+  WITHDRAWAL
+  CREDIT
+  DEBIT
+  ADJUSTMENT
+}
+
+enum BankAccountType {
+  CLIENT
+  AGENT
+  GLOBAL
+}
+
+enum VideoKind {
+  DEPOSIT
+  WITHDRAWAL
+}
+
+enum ClientScope {
+  ALL
+  SUSPICIOUS
+  NORMAL
+}
+
+model WhiteLabel {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  domain    String?
+  createdAt DateTime @default(now())
+
+  users   User[]
+  clients Client[]
+}
+
+model User {
+  id           String  @id @default(cuid())
+  username     String  @unique
+  passwordHash String
+  displayName  String
+  role         Role    @default(EMPLOYEE)
+  email        String?
+  phone        String?
+  isActive     Boolean @default(true)
+
+  /// Which white label this account belongs to
+  whiteLabelId String?
+  whiteLabel   WhiteLabel? @relation(fields: [whiteLabelId], references: [id])
+  /// The master this employee reports to (the "upline")
+  masterId String?
+  master   User?   @relation("MasterTeam", fields: [masterId], references: [id])
+  team     User[]  @relation("MasterTeam")
+
+  createdAt DateTime @default(now())
+
+  clients          Client[]        @relation("ClientOwner")
+  permissions      Permission[]    @relation("PermissionTarget")
+  grantedPerms     Permission[]    @relation("PermissionGranter")
+  createdRequests  Request[]       @relation("RequestCreator")
+  reviewedRequests Request[]       @relation("RequestReviewer")
+  twoFactor        TwoFactor?
+  devices          TrustedDevice[]
+  remarks          Remark[]
+  ledgerEntries    LedgerEntry[]
+  broadcasts       Broadcast[]
+  videos           Video[]
+  auditLogs        AuditLog[]
+  bankAccounts     BankAccount[]
+}
+
+/// A player/client account the employee manages. `code` is the 10-char hex style id
+/// shown in the panel tables.
+model Client {
+  id          String      @id @default(cuid())
+  code        String      @unique
+  username    String      @unique
+  displayName String
+  scope       ClientScope @default(NORMAL)
+
+  whiteLabelId String
+  whiteLabel   WhiteLabel @relation(fields: [whiteLabelId], references: [id])
+  /// Employee that owns this client relationship
+  ownerId String?
+  owner   User?   @relation("ClientOwner", fields: [ownerId], references: [id])
+
+  balancePaisa        BigInt @default(0)
+  creditReferencePaisa BigInt @default(0)
+  playerBalancePaisa  BigInt @default(0)
+  exposurePaisa       BigInt @default(0)
+  pnlPaisa            BigInt @default(0)
+
+  isActive  Boolean @default(true)
+  createdAt DateTime @default(now())
+
+  requests   Request[]
+  ledger     LedgerEntry[]
+  banks      BankAccount[]
+  settings   ClientSetting?
+  broadcasts Broadcast[]
+  videos     Video[]
+  statements Statement[]
+
+  @@index([ownerId])
+}
+
+model Request {
+  id          String        @id @default(cuid())
+  clientId    String
+  client      Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  type        RequestType
+  amountPaisa BigInt
+  status      RequestStatus @default(PENDING)
+
+  /// For withdrawals: where the money is going, e.g. "bank/Canara Bank"
+  destination String?
+  utr         String?
+  remark      String?
+  screenshot  String?
+
+  createdById String?
+  createdBy   User?   @relation("RequestCreator", fields: [createdById], references: [id])
+  reviewedById String?
+  reviewedBy   User?   @relation("RequestReviewer", fields: [reviewedById], references: [id])
+  reviewedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([clientId])
+  @@index([createdAt])
+}
+
+/// Append-only money trail. Never mutate a balance without writing one of these.
+model LedgerEntry {
+  id          String     @id @default(cuid())
+  clientId    String
+  client      Client     @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  type        LedgerType
+  amountPaisa BigInt
+  balanceAfterPaisa BigInt
+  referenceId String?
+  note        String?
+  actorId     String?
+  actor       User?      @relation(fields: [actorId], references: [id])
+  createdAt   DateTime   @default(now())
+
+  @@index([clientId, createdAt])
+}
+
+model BankAccount {
+  id            String          @id @default(cuid())
+  type          BankAccountType @default(CLIENT)
+  holderName    String
+  accountNumber String
+  ifsc          String?
+  bankName      String
+  upiId         String?
+  isActive      Boolean         @default(true)
+
+  clientId String?
+  client   Client? @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  ownerId  String?
+  owner    User?   @relation(fields: [ownerId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  activities BankActivityLog[]
+
+  @@index([type])
+}
+
+model BankActivityLog {
+  id            String      @id @default(cuid())
+  bankAccountId String
+  bankAccount   BankAccount @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  action        String
+  amountPaisa   BigInt      @default(0)
+  note          String?
+  actor         String?
+  createdAt     DateTime    @default(now())
+
+  @@index([bankAccountId, createdAt])
+}
+
+model ClientSetting {
+  id     String @id @default(cuid())
+  clientId String @unique
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  paymentLimitMinPaisa BigInt @default(0)
+  paymentLimitMaxPaisa BigInt @default(0)
+  stakes               Json   @default("[]")
+  walletMultiplier     Json   @default("{}")
+  rules                Json   @default("[]")
+
+  updatedAt DateTime @updatedAt
+}
+
+model Statement {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  periodStart DateTime
+  periodEnd   DateTime
+  openingPaisa BigInt
+  closingPaisa BigInt
+  depositPaisa BigInt    @default(0)
+  withdrawalPaisa BigInt @default(0)
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  @@index([clientId])
+}
+
+model Remark {
+  id          String   @id @default(cuid())
+  type        String   @default("GENERAL")
+  text        String
+  createdById String?
+  createdBy   User?    @relation(fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+}
+
+/// Module-level access granted by a master/white label to an employee.
+model Permission {
+  id          String   @id @default(cuid())
+  module      String
+  canRead     Boolean  @default(false)
+  canWrite    Boolean  @default(false)
+
+  employeeId  String
+  employee    User     @relation("PermissionTarget", fields: [employeeId], references: [id], onDelete: Cascade)
+  grantedById String?
+  grantedBy   User?    @relation("PermissionGranter", fields: [grantedById], references: [id])
+  updatedAt   DateTime @updatedAt
+
+  @@unique([employeeId, module])
+}
+
+model TwoFactor {
+  id       String  @id @default(cuid())
+  userId   String  @unique
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  secret   String?
+  enabled  Boolean @default(false)
+  email    String?
+  emailVerified   Boolean @default(false)
+  emailCode       String?
+  emailCodeExpiresAt DateTime?
+  trustedDevicesEnabled Boolean @default(true)
+  methodDisabled Boolean @default(false)
+  updatedAt DateTime @updatedAt
+}
+
+model TrustedDevice {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  label     String
+  ip        String?
+  lastUsedAt DateTime @default(now())
+  createdAt DateTime @default(now())
+}
+
+model Broadcast {
+  id       String @id @default(cuid())
+  title    String
+  message  String
+  clientId String?
+  client   Client? @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  createdById String?
+  createdBy   User?   @relation(fields: [createdById], references: [id])
+  createdAt DateTime @default(now())
+
+  @@index([clientId])
+}
+
+model Video {
+  id       String    @id @default(cuid())
+  title    String
+  kind     VideoKind @default(DEPOSIT)
+  url      String
+  clientId String?
+  client   Client? @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  createdById String?
+  createdBy   User?   @relation(fields: [createdById], references: [id])
+  createdAt DateTime @default(now())
+
+  @@index([clientId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  actor     User?    @relation(fields: [actorId], references: [id])
+  action    String
+  entity    String
+  entityId  String?
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([entity, entityId])
+}
